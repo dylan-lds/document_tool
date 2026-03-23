@@ -7,6 +7,8 @@ Word 文档读取与章节提取工具
 - 按章节名称模糊/语义匹配查找内容
 - 按 token 数量进行滑动窗口分块，保留重叠上下文
 - 提供文档元数据（标题层级、节标题等）
+
+底层转换：mammoth (docx→HTML) + markdownify (HTML→Markdown)，输出纯正 Markdown。
 """
 
 from __future__ import annotations
@@ -18,27 +20,39 @@ import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+import mammoth
+import markdownify
 import tiktoken
-from docx import Document
-from docx.document import Document as _Document
-from docx.oxml.ns import qn
-from docx.table import Table, _Cell
-from docx.text.paragraph import Paragraph
 
 
 # ── 分块配置 ──────────────────────────────────────────────────────────────────
-CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "6000"))       # 每块最大 token 数
-CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "500"))  # 块间重叠 token 数
-FUZZY_THRESHOLD: float = float(os.getenv("FUZZY_THRESHOLD", "0.45"))  # 模糊匹配阈值
+CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "6000"))
+CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "500"))
+FUZZY_THRESHOLD: float = float(os.getenv("FUZZY_THRESHOLD", "0.45"))
 HTTP_DOC_TIMEOUT: float = float(os.getenv("HTTP_DOC_TIMEOUT", "20"))
 
 _ENCODER = tiktoken.get_encoding("cl100k_base")
 logger = logging.getLogger("pharma-mcp.document")
+
+# mammoth 样式映射：保留标题层级，其余不转样式名
+_MAMMOTH_STYLE_MAP = """
+p[style-name='heading 1'] => h1:fresh
+p[style-name='heading 2'] => h2:fresh
+p[style-name='heading 3'] => h3:fresh
+p[style-name='heading 4'] => h4:fresh
+p[style-name='heading 5'] => h5:fresh
+p[style-name='heading 6'] => h6:fresh
+p[style-name='标题 1'] => h1:fresh
+p[style-name='标题 2'] => h2:fresh
+p[style-name='标题 3'] => h3:fresh
+p[style-name='标题 4'] => h4:fresh
+p[style-name='标题 5'] => h5:fresh
+p[style-name='标题 6'] => h6:fresh
+"""
 
 
 def _is_http_url(file_path: str) -> bool:
@@ -54,8 +68,8 @@ def _cache_key_for_source(file_path: str) -> str:
     return f"file::{local}"
 
 
-def _load_docx_document(file_path: str) -> Document:
-    """加载 DOCX：支持本地路径和 HTTP(S) URL。"""
+def _load_docx_bytes(file_path: str) -> bytes:
+    """加载 DOCX 原始字节：支持本地路径和 HTTP(S) URL。"""
     src = file_path.strip()
     if _is_http_url(src):
         logger.info("从 HTTP(S) 下载 Word 文档: %s", src)
@@ -65,38 +79,54 @@ def _load_docx_document(file_path: str) -> Document:
                 data = resp.read()
                 content_type = (resp.headers.get("Content-Type") or "").lower()
         except HTTPError as e:
-            logger.error("下载文档失败(HTTP): %s status=%s", src, getattr(e, "code", "unknown"))
             raise ValueError(f"HTTP 文档下载失败：{src}，状态码：{getattr(e, 'code', 'unknown')}") from e
         except URLError as e:
-            logger.error("下载文档失败(URL): %s reason=%s", src, getattr(e, "reason", "unknown"))
             raise ValueError(f"HTTP 文档下载失败：{src}，原因：{getattr(e, 'reason', 'unknown')}") from e
-
         if not data:
-            logger.error("下载文档为空: %s", src)
             raise ValueError(f"HTTP 文档为空：{src}")
-
         if not src.lower().endswith(".docx") and "officedocument.wordprocessingml.document" not in content_type:
-            logger.warning("URL 可能不是 docx 文件: %s content-type=%s", src, content_type)
-
-        try:
-            return Document(io.BytesIO(data))
-        except Exception as e:
-            logger.error("HTTP 文档解析失败: %s", src)
-            raise ValueError(f"HTTP 文档解析失败（非有效 .docx）：{src}") from e
+            logger.warning("URL 可能不是 docx: %s content-type=%s", src, content_type)
+        return data
 
     path = Path(src).expanduser()
-    logger.info("读取本地 Word 文档: %s", path)
     if not path.exists():
-        logger.error("文档不存在: %s", src)
         raise FileNotFoundError(f"文件不存在：{file_path}")
     if path.suffix.lower() != ".docx":
-        logger.error("文档格式不支持: %s", path.suffix)
         raise ValueError(f"仅支持 .docx 格式，当前文件：{path.suffix}")
-    return Document(str(path))
+    return path.read_bytes()
+
+
+def _convert_to_markdown(file_path: str) -> str:
+    """
+    docx → HTML (mammoth) → Markdown (markdownify)。
+
+    - mammoth 按 Word 样式正确识别标题层级，输出语义化 HTML
+    - markdownify 将 HTML table 转为标准 Markdown 表格
+    - 嵌套表格放在单元格内，以缩进 Markdown 表格形式呈现（Markdown 固有限制）
+    """
+    raw = _load_docx_bytes(file_path)
+    result = mammoth.convert_to_html(
+        io.BytesIO(raw),
+        style_map=_MAMMOTH_STYLE_MAP,
+        convert_image=mammoth.images.img_element(lambda _: {}),
+    )
+    if result.messages:
+        for msg in result.messages:
+            logger.debug("mammoth: %s", msg)
+
+    md = markdownify.markdownify(
+        result.value,
+        heading_style="ATX",        # # ## ### 风格
+        bullets="-",                # 统一用 -
+        newline_style="backslash",  # 换行用 \
+        strip=["img"],              # 去掉图片
+    )
+    # 清理多余空行（连续 3 个以上空行压缩为 2 个）
+    md = re.sub(r"\n{3,}", "\n\n", md).strip()
+    return md
 
 
 def _count_tokens(text: str) -> int:
-    logger.debug("统计文本 token 数, 长度=%d", len(text))
     return len(_ENCODER.encode(text))
 
 
@@ -119,113 +149,75 @@ class DocMeta:
     section_titles: list[str] = field(default_factory=list)
 
 
-# ── 文档内容提取 ──────────────────────────────────────────────────────────────
+# ── Markdown 块解析 ───────────────────────────────────────────────────────────
 
-def _iter_block_items(parent: _Document | _Cell) -> Iterator[Paragraph | Table]:
-    """按文档/单元格原始顺序迭代段落和表格。"""
-    logger.debug("开始遍历文档块: parent=%s", type(parent).__name__)
-
-    if isinstance(parent, _Document):
-        container = parent.element.body
-    elif isinstance(parent, _Cell):
-        container = parent._tc
-    else:
-        raise TypeError(f"不支持的块容器类型: {type(parent)!r}")
-
-    for child in container.iterchildren():
-        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-        if tag == "p":
-            yield Paragraph(child, parent)
-        elif tag == "tbl":
-            yield Table(child, parent)
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 
 
-def _normalize_table_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
+def _parse_md_blocks(
+    markdown: str,
+) -> list[tuple[str, int | None, str]]:
+    """
+    将 Markdown 文本切分为类型化的块列表。
 
+    返回：
+        [('heading', level, title), ('table', None, markdown_table), ('text', None, text), ...]
+    """
+    lines = markdown.split("\n")
+    blocks: list[tuple[str, int | None, str]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
 
-def _escape_markdown_cell(text: str) -> str:
-    return text.replace("|", r"\|").replace("\n", "<br>")
+        # 标题行
+        m = _HEADING_RE.match(line)
+        if m:
+            blocks.append(("heading", len(m.group(1)), m.group(2).strip()))
+            i += 1
+            continue
 
+        # 表格行（以 | 开头，收集连续行）
+        if line.strip().startswith("|"):
+            table_lines: list[str] = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                table_lines.append(lines[i])
+                i += 1
+            blocks.append(("table", None, "\n".join(table_lines)))
+            continue
 
-def _cell_to_text(cell: _Cell, depth: int = 0) -> str:
-    """按块顺序提取单元格文本，递归保留嵌套表格。"""
-    parts: list[str] = []
-    nested_table_index = 0
+        # 空行跳过
+        if not line.strip():
+            i += 1
+            continue
 
-    for block in _iter_block_items(cell):
-        if isinstance(block, Paragraph):
-            text = _normalize_table_text(block.text)
-            if text:
-                parts.append(text)
-        elif isinstance(block, Table):
-            nested_table_index += 1
-            nested_text = _table_to_text(block, depth + 1)
-            if nested_text:
-                parts.append(
-                    f"[Nested Table L{depth + 1}.{nested_table_index}]\n{nested_text}"
-                )
+        # 普通段落（收集连续非空、非标题、非表格的行）
+        para_lines: list[str] = []
+        while (
+            i < len(lines)
+            and lines[i].strip()
+            and not lines[i].strip().startswith("|")
+            and not _HEADING_RE.match(lines[i])
+        ):
+            para_lines.append(lines[i])
+            i += 1
+        if para_lines:
+            blocks.append(("text", None, "\n".join(para_lines)))
 
-    return "\n".join(parts).strip()
-
-
-def _table_to_text(table: Table, depth: int = 0) -> str:
-    """将表格转换为适合大模型消费的 Markdown 风格文本，保留嵌套表格。"""
-    logger.debug("表格转文本, depth=%d 行数=%d", depth, len(table.rows))
-    rows_text: list[str] = []
-    max_cols = max((len(row.cells) for row in table.rows), default=0)
-    if max_cols == 0:
-        return ""
-
-    for i, row in enumerate(table.rows):
-        cells = [_cell_to_text(cell, depth) for cell in row.cells]
-        if len(cells) < max_cols:
-            cells.extend([""] * (max_cols - len(cells)))
-        escaped_cells = [_escape_markdown_cell(cell) for cell in cells]
-        rows_text.append("| " + " | ".join(escaped_cells) + " |")
-        if i == 0:
-            rows_text.append("| " + " | ".join(["---"] * max_cols) + " |")
-    return "\n".join(rows_text)
+    return blocks
 
 
 def extract_document_text(file_path: str) -> tuple[str, list[str]]:
     """
-    提取 Word 文档全部文本内容。
+    提取 Word 文档全部 Markdown 文本。
 
     Returns:
-        (full_text, section_titles) 全文字符串 + 所有标题列表
+        (full_markdown, section_titles)
     """
-    logger.info("开始读取 Word 文档: %s", file_path)
-    doc = _load_docx_document(file_path)
-    parts: list[str] = []
-    section_titles: list[str] = []
-
-    for block in _iter_block_items(doc):
-        if isinstance(block, Paragraph):
-            text = block.text.strip()
-            if not text:
-                continue
-            # 识别标题段落
-            style_name = block.style.name if block.style else ""
-            if style_name.startswith("Heading") or style_name.startswith("标题"):
-                section_titles.append(text)
-                parts.append(f"\n{'#' * _heading_level(style_name)} {text}\n")
-            else:
-                parts.append(text)
-        elif isinstance(block, Table):
-            parts.append("\n" + _table_to_text(block) + "\n")
-
-    full_text = "\n".join(parts)
-    logger.info("文档读取完成: chars=%d sections=%d", len(full_text), len(section_titles))
-    return full_text, section_titles
-
-
-def _heading_level(style_name: str) -> int:
-    """从样式名称解析标题层级，默认返回 2。"""
-    for char in style_name:
-        if char.isdigit():
-            return int(char)
-    return 2
+    logger.info("开始读取 Word 文档（mammoth）: %s", file_path)
+    md = _convert_to_markdown(file_path)
+    titles = [m.group(2).strip() for m in (_HEADING_RE.match(l) for l in md.split("\n")) if m]
+    logger.info("文档读取完成: chars=%d headings=%d", len(md), len(titles))
+    return md, titles
 
 
 # ── 长文本分块 ────────────────────────────────────────────────────────────────
@@ -343,83 +335,62 @@ class Section:
     children: list[Section] = field(default_factory=list)
 
     def full_text(self) -> str:
-        """递归获取该章节及其所有子章节的完整文本。"""
-        parts = []
-        prefix = "#" * self.level
-        parts.append(f"{prefix} {self.title}\n")
-        for alias in self.aliases:
-            parts.append(f"{prefix} {alias}\n")
+        """递归获取该章节及其所有子章节的完整 Markdown 文本。"""
+        parts: list[str] = []
+        if self.level > 0:
+            prefix = "#" * self.level
+            heading_lines = [f"{prefix} {self.title}"]
+            for alias in self.aliases:
+                heading_lines.append(f"{prefix} {alias}")
+            parts.append("\n".join(heading_lines))
         if self.content.strip():
             parts.append(self.content.strip())
         for child in self.children:
             parts.append(child.full_text())
-        return "\n\n".join(parts)
+        return "\n\n".join(p for p in parts if p)
 
 
 # ── 章节结构化解析 ────────────────────────────────────────────────────────────
 
 def extract_sections(file_path: str) -> tuple[list[Section], str, list[str]]:
     """
-    解析 Word 文档为章节树。
+    解析 Word 文档为章节树（基于 mammoth+markdownify 输出的纯 Markdown）。
 
     Returns:
-        (top_level_sections, full_text, all_section_titles)
+        (top_level_sections, full_markdown, all_section_titles)
     """
     logger.info("开始解析文档章节结构: %s", file_path)
-    doc = _load_docx_document(file_path)
+    full_text = _convert_to_markdown(file_path)
+    blocks = _parse_md_blocks(full_text)
 
-    # 先线性提取所有块
-    blocks: list[tuple[str, int | None, str]] = []  # (type, heading_level, text)
     all_titles: list[str] = []
-    full_parts: list[str] = []
-
-    for block in _iter_block_items(doc):
-        if isinstance(block, Paragraph):
-            text = block.text.strip()
-            if not text:
-                continue
-            style_name = block.style.name if block.style else ""
-            if style_name.startswith("Heading") or style_name.startswith("标题"):
-                level = _heading_level(style_name)
-                blocks.append(("heading", level, text))
-                all_titles.append(text)
-                full_parts.append(f"\n{'#' * level} {text}\n")
-            else:
-                blocks.append(("text", None, text))
-                full_parts.append(text)
-        elif isinstance(block, Table):
-            table_text = _table_to_text(block)
-            blocks.append(("table", None, table_text))
-            full_parts.append("\n" + table_text + "\n")
-
-    full_text = "\n".join(full_parts)
-
-    # 构建章节树
     root_sections: list[Section] = []
-    # 栈中保存 (level, Section) 用于构建父子关系
     stack: list[Section] = []
     current_body_parts: list[str] = []
     last_heading_section: Section | None = None
     last_was_heading = False
 
     def _heading_number(text: str) -> str:
-        match = re.match(r"\s*(\d+(?:\.\d+)*)", text)
-        return match.group(1) if match else ""
+        m = re.match(r"\s*(\d+(?:\.\d+)*)", text)
+        return m.group(1) if m else ""
 
     def _flush_body() -> None:
-        """把累积的正文冲入最近的章节。"""
         if stack and current_body_parts:
-            stack[-1].content += "\n".join(current_body_parts)
+            block_text = "\n\n".join(current_body_parts)
+            if stack[-1].content.strip():
+                stack[-1].content += "\n\n" + block_text
+            else:
+                stack[-1].content = block_text
             current_body_parts.clear()
 
-    # 文档开头无标题的前言内容
     preamble_parts: list[str] = []
 
     for btype, level, text in blocks:
         if btype == "heading":
             _flush_body()
+            all_titles.append(text)
 
-            # 中英文并行文档：若连续两个同层级、同编号标题相邻，则视为同一章节的别名
+            # 中英文并行文档：同层级同编号相邻标题合并为别名
             if (
                 last_was_heading
                 and last_heading_section is not None
@@ -429,17 +400,12 @@ def extract_sections(file_path: str) -> tuple[list[Section], str, list[str]]:
                 and not last_heading_section.content.strip()
                 and not last_heading_section.children
             ):
-                logger.info(
-                    "合并双语同编号标题: primary='%s' alias='%s'",
-                    last_heading_section.title,
-                    text,
-                )
+                logger.info("合并双语标题: '%s' / '%s'", last_heading_section.title, text)
                 last_heading_section.aliases.append(text)
                 last_was_heading = True
                 continue
 
             section = Section(title=text, level=level, content="")
-            # 找到合适的父节点
             while stack and stack[-1].level >= level:
                 stack.pop()
             if stack:
@@ -450,24 +416,23 @@ def extract_sections(file_path: str) -> tuple[list[Section], str, list[str]]:
             last_heading_section = section
             last_was_heading = True
         else:
+            # 表格块前后留空行，保证 Markdown 渲染正确
+            item = ("\n" + text + "\n") if btype == "table" else text
             if stack:
-                current_body_parts.append(text)
+                current_body_parts.append(item)
             else:
-                preamble_parts.append(text)
+                preamble_parts.append(item)
             last_was_heading = False
 
     _flush_body()
 
-    # 如有前言，插入一个虚拟章节
     if preamble_parts:
-        preamble = Section(title="（前言/封面）", level=0, content="\n".join(preamble_parts))
+        preamble = Section(title="（前言/封面）", level=0, content="\n\n".join(preamble_parts))
         root_sections.insert(0, preamble)
 
     logger.info(
         "章节解析完成: root_sections=%d all_titles=%d full_chars=%d",
-        len(root_sections),
-        len(all_titles),
-        len(full_text),
+        len(root_sections), len(all_titles), len(full_text),
     )
     return root_sections, full_text, all_titles
 
