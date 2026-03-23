@@ -27,6 +27,7 @@ from urllib.request import Request, urlopen
 import mammoth
 import markdownify
 import tiktoken
+from markdownify import MarkdownConverter
 
 
 # ── 分块配置 ──────────────────────────────────────────────────────────────────
@@ -96,13 +97,25 @@ def _load_docx_bytes(file_path: str) -> bytes:
     return path.read_bytes()
 
 
+class _HtmlTableConverter(MarkdownConverter):
+    """
+    与标准 MarkdownConverter 完全相同，但将 <table> 元素直接输出为
+    HTML 原始格式，而非 Markdown 管道表格。
+    HTML 表格对 LLM 更友好：清晰支持合并单元格、嵌套表格、换行内容。
+    """
+
+    def convert_table(self, el, text, **kwargs) -> str:  # type: ignore[override]
+        # el 是 BeautifulSoup 元素，decode() 还原为 HTML 字符串
+        return "\n\n" + el.decode() + "\n\n"
+
+
 def _convert_to_markdown(file_path: str) -> str:
     """
-    docx → HTML (mammoth) → Markdown (markdownify)。
+    docx → HTML (mammoth) → Markdown (markdownify，表格保留 HTML)。
 
     - mammoth 按 Word 样式正确识别标题层级，输出语义化 HTML
-    - markdownify 将 HTML table 转为标准 Markdown 表格
-    - 嵌套表格放在单元格内，以缩进 Markdown 表格形式呈现（Markdown 固有限制）
+    - 段落、列表、标题转为标准 Markdown
+    - <table> 保留 HTML 原始格式：更清晰，支持合并单元格和嵌套表格
     """
     raw = _load_docx_bytes(file_path)
     result = mammoth.convert_to_html(
@@ -114,13 +127,12 @@ def _convert_to_markdown(file_path: str) -> str:
         for msg in result.messages:
             logger.debug("mammoth: %s", msg)
 
-    md = markdownify.markdownify(
-        result.value,
+    md = _HtmlTableConverter(
         heading_style="ATX",        # # ## ### 风格
         bullets="-",                # 统一用 -
         newline_style="backslash",  # 换行用 \
         strip=["img"],              # 去掉图片
-    )
+    ).convert(result.value)
     # 清理多余空行（连续 3 个以上空行压缩为 2 个）
     md = re.sub(r"\n{3,}", "\n\n", md).strip()
     return md
