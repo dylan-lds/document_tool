@@ -25,8 +25,9 @@ from urllib.request import Request, urlopen
 
 import tiktoken
 from docx import Document
+from docx.document import Document as _Document
 from docx.oxml.ns import qn
-from docx.table import Table
+from docx.table import Table, _Cell
 from docx.text.paragraph import Paragraph
 
 
@@ -120,30 +121,70 @@ class DocMeta:
 
 # ── 文档内容提取 ──────────────────────────────────────────────────────────────
 
-def _iter_block_items(doc: Document) -> Iterator[Paragraph | Table]:
-    """按文档顺序迭代段落和表格（保持原始顺序）。"""
-    logger.debug("开始遍历文档块")
-    from docx.oxml import OxmlElement  # noqa: F401
+def _iter_block_items(parent: _Document | _Cell) -> Iterator[Paragraph | Table]:
+    """按文档/单元格原始顺序迭代段落和表格。"""
+    logger.debug("开始遍历文档块: parent=%s", type(parent).__name__)
 
-    body = doc.element.body
-    for child in body.iterchildren():
+    if isinstance(parent, _Document):
+        container = parent.element.body
+    elif isinstance(parent, _Cell):
+        container = parent._tc
+    else:
+        raise TypeError(f"不支持的块容器类型: {type(parent)!r}")
+
+    for child in container.iterchildren():
         tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
         if tag == "p":
-            yield Paragraph(child, doc)
+            yield Paragraph(child, parent)
         elif tag == "tbl":
-            yield Table(child, doc)
+            yield Table(child, parent)
 
 
-def _table_to_text(table: Table) -> str:
-    """将表格转换为 Markdown 风格文本。"""
-    logger.debug("表格转文本, 行数=%d", len(table.rows))
+def _normalize_table_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _escape_markdown_cell(text: str) -> str:
+    return text.replace("|", r"\|").replace("\n", "<br>")
+
+
+def _cell_to_text(cell: _Cell, depth: int = 0) -> str:
+    """按块顺序提取单元格文本，递归保留嵌套表格。"""
+    parts: list[str] = []
+    nested_table_index = 0
+
+    for block in _iter_block_items(cell):
+        if isinstance(block, Paragraph):
+            text = _normalize_table_text(block.text)
+            if text:
+                parts.append(text)
+        elif isinstance(block, Table):
+            nested_table_index += 1
+            nested_text = _table_to_text(block, depth + 1)
+            if nested_text:
+                parts.append(
+                    f"[Nested Table L{depth + 1}.{nested_table_index}]\n{nested_text}"
+                )
+
+    return "\n".join(parts).strip()
+
+
+def _table_to_text(table: Table, depth: int = 0) -> str:
+    """将表格转换为适合大模型消费的 Markdown 风格文本，保留嵌套表格。"""
+    logger.debug("表格转文本, depth=%d 行数=%d", depth, len(table.rows))
     rows_text: list[str] = []
+    max_cols = max((len(row.cells) for row in table.rows), default=0)
+    if max_cols == 0:
+        return ""
+
     for i, row in enumerate(table.rows):
-        cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
-        rows_text.append("| " + " | ".join(cells) + " |")
+        cells = [_cell_to_text(cell, depth) for cell in row.cells]
+        if len(cells) < max_cols:
+            cells.extend([""] * (max_cols - len(cells)))
+        escaped_cells = [_escape_markdown_cell(cell) for cell in cells]
+        rows_text.append("| " + " | ".join(escaped_cells) + " |")
         if i == 0:
-            # 表头分隔线
-            rows_text.append("| " + " | ".join(["---"] * len(cells)) + " |")
+            rows_text.append("| " + " | ".join(["---"] * max_cols) + " |")
     return "\n".join(rows_text)
 
 
