@@ -27,7 +27,9 @@ from urllib.request import Request, urlopen
 import mammoth
 import markdownify
 import tiktoken
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
+from docx import Document as _DocxDocument
+from docx.oxml.ns import qn as _qn
 from markdownify import MarkdownConverter
 
 
@@ -114,45 +116,185 @@ class _HtmlTableConverter(MarkdownConverter):
 _NUM_SEC_RE = re.compile(r"^(\d{1,2}(?:\.\d{1,2})*\.?)\s+\S")
 
 
-def _promote_numbered_headings(html: str) -> str:
-    """
-    将形如 'N. 标题' / 'N.N 标题' 的普通段落提升为 <h{level}> 标签。
+def _get_paragraph_outline_level(para) -> int | None:
+    """获取段落大纲级别（直接属性或样式继承）。返回 1-based 级别 (1~6)，无大纲返回 None。"""
+    # 直接段落属性
+    pPr = para._element.find(_qn('w:pPr'))
+    if pPr is not None:
+        outlineLvl = pPr.find(_qn('w:outlineLvl'))
+        if outlineLvl is not None:
+            val = int(outlineLvl.get(_qn('w:val')))
+            if val < 9:  # 9 = body text
+                return min(val + 1, 6)
 
-    仅当文档中无任何 <h1>~<h6> 标签时执行（即 mammoth 未识别到 Word
-    标题样式），以兼容不使用标准 Heading 样式、改用编号段落的文档。
-    对已有标题标签的老文档完全透明。
+    # 样式继承链
+    style = para.style
+    seen: set[int] = set()
+    while style is not None and id(style) not in seen:
+        seen.add(id(style))
+        style_pPr = style.element.find(_qn('w:pPr'))
+        if style_pPr is not None:
+            outlineLvl = style_pPr.find(_qn('w:outlineLvl'))
+            if outlineLvl is not None:
+                val = int(outlineLvl.get(_qn('w:val')))
+                if val < 9:
+                    return min(val + 1, 6)
+        style = style.base_style
+
+    return None
+
+
+def _extract_outline_headings(raw: bytes) -> list[tuple[str, int]]:
+    """
+    通过 python-docx 读取每个段落的大纲级别 (outlineLvl)。
+
+    Word 导航栏中可见的标题就是通过大纲级别决定的。
+    无论样式是内置 Heading 还是基于正文的自定义样式，只要设置了
+    大纲级别，此函数都能正确识别。
+
+    Returns:
+        [(段落文本, heading_level_1based), ...]
+    """
+    try:
+        doc = _DocxDocument(io.BytesIO(raw))
+    except Exception:
+        return []
+
+    result: list[tuple[str, int]] = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+        level = _get_paragraph_outline_level(para)
+        if level is not None:
+            result.append((text, level))
+            logger.debug("大纲标题: L%d '%s'", level, text[:60])
+
+    return result
+
+
+def _promote_headings(html: str, outline_headings: list[tuple[str, int]]) -> str:
+    """
+    综合提升章节标题，支持两种来源：
+
+    1. python-docx 大纲级别（最可靠）：精确匹配 <p> 和 <li> 中的标题文本
+    2. 回退：基于编号模式 'N.' / 'N.N' 提升 <p> 标签
+
+    支持 mammoth 的两种典型输出：
+    - 自定义正文样式标题 → mammoth 输出为 <ol><li>（多级列表）
+    - 自定义正文样式标题 → mammoth 输出为 <p>（普通段落）
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # mammoth 已识别出标题，无需处理
-    if soup.find(re.compile(r"^h[1-6]$")):
-        return html
+    # 构建 heading map: {normalized_text: level}
+    heading_map: dict[str, int] = {}
+    for text, level in outline_headings:
+        key = re.sub(r'\s+', ' ', text).strip()
+        heading_map[key] = level
 
-    for p in soup.find_all("p"):
-        raw = p.get_text(separator=" ", strip=True)
-        m = _NUM_SEC_RE.match(raw)
-        if not m:
+    # Phase 1: 处理 <p> 标签（大纲匹配 + 编号回退）
+    for p in list(soup.find_all('p')):
+        if p.find_parent(['table', 'td', 'th']):
             continue
-        num_str = m.group(1).rstrip(".")
-        level = len(num_str.split("."))
+        raw = p.get_text(separator=' ', strip=True)
+        key = re.sub(r'\s+', ' ', raw).strip()
+
+        level = heading_map.get(key)
+        if level is None:
+            # 回退：编号模式
+            m = _NUM_SEC_RE.match(raw)
+            if m:
+                num_str = m.group(1).rstrip('.')
+                level = len(num_str.split('.'))
+
+        if level is not None:
+            h = soup.new_tag(f"h{min(level, 6)}")
+            for child in list(p.children):
+                h.append(child.extract())
+            p.replace_with(h)
+            logger.debug("提升标题(p): L%d '%s'", level, key[:60])
+
+    # Phase 2: 处理 <li> 标签（mammoth 将自定义列表样式转为 <ol><li>）
+    # 从内到外处理，避免嵌套结构突变
+    for li in reversed(list(soup.find_all('li'))):
+        if li.find_parent(['table', 'td', 'th']):
+            continue
+
+        # 提取第一个 <p> 或直接内联文本作为标题候选
+        first_p = li.find('p', recursive=False)
+        if first_p:
+            raw = first_p.get_text(separator=' ', strip=True)
+        else:
+            # 收集直接内联内容（文本节点 + 内联标签）
+            parts: list[str] = []
+            for child in li.children:
+                if isinstance(child, NavigableString):
+                    parts.append(str(child))
+                elif hasattr(child, 'name') and child.name in (
+                    'strong', 'em', 'b', 'i', 'span', 'a',
+                ):
+                    parts.append(child.get_text())
+                else:
+                    break
+            raw = ''.join(parts).strip()
+
+        if not raw:
+            continue
+
+        key = re.sub(r'\s+', ' ', raw).strip()
+        level = heading_map.get(key)
+
+        if level is None:
+            continue
+
+        # 创建 <h> 标签
         h = soup.new_tag(f"h{min(level, 6)}")
-        h.string = raw
-        p.replace_with(h)
-        logger.debug("提升编号标题: L%d '%s'", level, raw[:60])
+        if first_p:
+            for child in list(first_p.children):
+                h.append(child.extract())
+            first_p.decompose()
+        else:
+            h.string = raw
+
+        # 将 <h> 和 <li> 的剩余块级子元素移到 <ol> 之前
+        parent_list = li.find_parent(['ol', 'ul'])
+        if parent_list:
+            parent_list.insert_before(h)
+            insert_point = h
+            for child in list(li.children):
+                if isinstance(child, NavigableString) and not child.strip():
+                    continue
+                child.extract()
+                insert_point.insert_after(child)
+                insert_point = child
+            li.decompose()
+
+            # 清理空的 <ol>/<ul>
+            if not parent_list.find('li'):
+                parent_list.decompose()
+
+            logger.debug("提升标题(li): L%d '%s'", level, key[:60])
 
     return str(soup)
 
 
 def _convert_to_markdown(file_path: str) -> str:
     """
-    docx → HTML (mammoth) → 编号标题提升 → Markdown (markdownify，表格保留 HTML)。
+    docx → HTML (mammoth) → 标题提升 → Markdown (markdownify，表格保留 HTML)。
 
-    - mammoth 按 Word 样式正确识别标题层级，输出语义化 HTML
-    - 若文档无 Heading 样式，自动将 'N. 标题' / 'N.N 标题' 编号段落提升为 <h> 标签
-    - 段落、列表、标题转为标准 Markdown
-    - <table> 保留 HTML 原始格式：更清晰，支持合并单元格和嵌套表格
+    标题识别策略（按优先级）：
+    1. mammoth 样式映射（内置 Heading / 标题 样式）
+    2. python-docx 读取大纲级别 outlineLvl（自定义正文样式但在导航栏可见）
+    3. 回退：编号模式 'N. / N.N' 段落自动提升
+
+    支持 mammoth 将自定义列表样式输出为 <ol><li> 的情形。
     """
     raw = _load_docx_bytes(file_path)
+
+    # Step 1: 用 python-docx 读取大纲级别
+    outline_headings = _extract_outline_headings(raw)
+
+    # Step 2: mammoth 转 HTML
     result = mammoth.convert_to_html(
         io.BytesIO(raw),
         style_map=_MAMMOTH_STYLE_MAP,
@@ -162,8 +304,10 @@ def _convert_to_markdown(file_path: str) -> str:
         for msg in result.messages:
             logger.debug("mammoth: %s", msg)
 
-    promoted_html = _promote_numbered_headings(result.value)
+    # Step 3: 提升标题（大纲级别 + 编号模式回退）
+    promoted_html = _promote_headings(result.value, outline_headings)
 
+    # Step 4: HTML → Markdown（表格保留 HTML）
     md = _HtmlTableConverter(
         heading_style="ATX",
         bullets="-",
