@@ -27,6 +27,7 @@ from urllib.request import Request, urlopen
 import mammoth
 import markdownify
 import tiktoken
+from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter
 
 
@@ -109,11 +110,45 @@ class _HtmlTableConverter(MarkdownConverter):
         return "\n\n" + el.decode() + "\n\n"
 
 
+# 匹配形如 '1. 标题' / '2.1 标题' / '3.1.2 标题' 的编号段落
+_NUM_SEC_RE = re.compile(r"^(\d{1,2}(?:\.\d{1,2})*\.?)\s+\S")
+
+
+def _promote_numbered_headings(html: str) -> str:
+    """
+    将形如 'N. 标题' / 'N.N 标题' 的普通段落提升为 <h{level}> 标签。
+
+    仅当文档中无任何 <h1>~<h6> 标签时执行（即 mammoth 未识别到 Word
+    标题样式），以兼容不使用标准 Heading 样式、改用编号段落的文档。
+    对已有标题标签的老文档完全透明。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # mammoth 已识别出标题，无需处理
+    if soup.find(re.compile(r"^h[1-6]$")):
+        return html
+
+    for p in soup.find_all("p"):
+        raw = p.get_text(separator=" ", strip=True)
+        m = _NUM_SEC_RE.match(raw)
+        if not m:
+            continue
+        num_str = m.group(1).rstrip(".")
+        level = len(num_str.split("."))
+        h = soup.new_tag(f"h{min(level, 6)}")
+        h.string = raw
+        p.replace_with(h)
+        logger.debug("提升编号标题: L%d '%s'", level, raw[:60])
+
+    return str(soup)
+
+
 def _convert_to_markdown(file_path: str) -> str:
     """
-    docx → HTML (mammoth) → Markdown (markdownify，表格保留 HTML)。
+    docx → HTML (mammoth) → 编号标题提升 → Markdown (markdownify，表格保留 HTML)。
 
     - mammoth 按 Word 样式正确识别标题层级，输出语义化 HTML
+    - 若文档无 Heading 样式，自动将 'N. 标题' / 'N.N 标题' 编号段落提升为 <h> 标签
     - 段落、列表、标题转为标准 Markdown
     - <table> 保留 HTML 原始格式：更清晰，支持合并单元格和嵌套表格
     """
@@ -127,13 +162,14 @@ def _convert_to_markdown(file_path: str) -> str:
         for msg in result.messages:
             logger.debug("mammoth: %s", msg)
 
+    promoted_html = _promote_numbered_headings(result.value)
+
     md = _HtmlTableConverter(
-        heading_style="ATX",        # # ## ### 风格
-        bullets="-",                # 统一用 -
-        newline_style="backslash",  # 换行用 \
-        strip=["img"],              # 去掉图片
-    ).convert(result.value)
-    # 清理多余空行（连续 3 个以上空行压缩为 2 个）
+        heading_style="ATX",
+        bullets="-",
+        newline_style="backslash",
+        strip=["img"],
+    ).convert(promoted_html)
     md = re.sub(r"\n{3,}", "\n\n", md).strip()
     return md
 
@@ -351,10 +387,7 @@ class Section:
         parts: list[str] = []
         if self.level > 0:
             prefix = "#" * self.level
-            heading_lines = [f"{prefix} {self.title}"]
-            for alias in self.aliases:
-                heading_lines.append(f"{prefix} {alias}")
-            parts.append("\n".join(heading_lines))
+            parts.append(f"{prefix} {self.title}")
         if self.content.strip():
             parts.append(self.content.strip())
         for child in self.children:
@@ -382,10 +415,6 @@ def extract_sections(file_path: str) -> tuple[list[Section], str, list[str]]:
     last_heading_section: Section | None = None
     last_was_heading = False
 
-    def _heading_number(text: str) -> str:
-        m = re.match(r"\s*(\d+(?:\.\d+)*)", text)
-        return m.group(1) if m else ""
-
     def _flush_body() -> None:
         if stack and current_body_parts:
             block_text = "\n\n".join(current_body_parts)
@@ -401,21 +430,6 @@ def extract_sections(file_path: str) -> tuple[list[Section], str, list[str]]:
         if btype == "heading":
             _flush_body()
             all_titles.append(text)
-
-            # 中英文并行文档：同层级同编号相邻标题合并为别名
-            if (
-                last_was_heading
-                and last_heading_section is not None
-                and last_heading_section.level == level
-                and _heading_number(last_heading_section.title)
-                and _heading_number(last_heading_section.title) == _heading_number(text)
-                and not last_heading_section.content.strip()
-                and not last_heading_section.children
-            ):
-                logger.info("合并双语标题: '%s' / '%s'", last_heading_section.title, text)
-                last_heading_section.aliases.append(text)
-                last_was_heading = True
-                continue
 
             section = Section(title=text, level=level, content="")
             while stack and stack[-1].level >= level:
@@ -590,6 +604,7 @@ def get_section_content(file_path: str, section_name: str) -> dict:
     else:
         try:
             sections, full_text, all_titles = extract_sections(file_path)
+            # logger.info("sections: %s , all_titles: %s, full_text: %d", sections, all_titles, full_text)
             _DOC_CACHE[cache_key] = (sections, full_text, all_titles)
             logger.info("文档解析结果已缓存: %s", file_path)
         except (FileNotFoundError, ValueError) as e:

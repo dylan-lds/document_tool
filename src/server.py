@@ -36,9 +36,9 @@ load_dotenv()
 from src.utils.document_reader import get_section_content as _get_section_content
 from src.utils.pdf_reader import extract_pdf_content as _extract_pdf_content
 
-MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1")
+MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
-OPENAPI_HOST = os.getenv("OPENAPI_HOST", "127.0.0.1")
+OPENAPI_HOST = os.getenv("OPENAPI_HOST", "0.0.0.0")
 OPENAPI_PORT = int(os.getenv("OPENAPI_PORT", "8001"))
 
 mcp = FastMCP("pharma-doc-reader", host=MCP_HOST, port=MCP_PORT)
