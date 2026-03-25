@@ -1,0 +1,335 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Pharma Doc Reader API",
+    "description": "专门用于医药行业 Word / PDF 文档内容提取工具。支持按章节名称模糊匹配提取 Word 指定章节内容，也支持按章节名称提取 PDF 内容。",
+    "version": "1.1.0"
+  },
+  "servers": [
+    {
+      "url": "http://172.17.0.1:8001",
+      "description": "本地开发服务器"
+    }
+  ],
+  "paths": {
+    "/section-content": {
+      "post": {
+        "tags": ["document"],
+        "summary": "按章节提取 Word 文档内容 (POST)",
+        "operationId": "PostSectionContent",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["file_path", "section_name"],
+                "properties": {
+                  "file_path": {
+                    "type": "string",
+                    "description": "Word 文档的路径或 URL"
+                  },
+                  "section_name": {
+                    "type": "string",
+                    "description": "章节名称或关键字，支持模糊匹配，传 * 可返回全文"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "提取成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SectionContentResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "请求参数校验失败",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/pdf-page-content": {
+      "post": {
+        "tags": ["document"],
+        "summary": "按页码提取 PDF 内容 (POST)",
+        "description": "按页码从 PDF 中提取正文及表格内容。支持单页（\"3\"）、范围（\"2-5\"）、组合（\"1,3-5,7\"）三种格式。",
+        "operationId": "PostPDFPageContent",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["file_path", "page_numbers"],
+                "properties": {
+                  "file_path": {
+                    "type": "string",
+                    "description": "PDF 文档的本地路径或 URL"
+                  },
+                  "page_numbers": {
+                    "type": "string",
+                    "description": "页码，支持单页 \"3\"、范围 \"2-5\"、组合 \"1,3-5,7\""
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "提取成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PDFPageContentResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "请求参数校验失败",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/pdf-section-content": {
+      "post": {
+        "tags": ["document"],
+        "summary": "按章节提取 PDF 文档内容 (POST)",
+        "description": "从 PDF 文档中按章节名称模糊匹配提取内容。PDF 中的编号标题（如 '4.3.2 预验证结果'）自动识别为章节。传 * 可返回全文。表格以 HTML 格式嵌入，适合大模型输入。",
+        "operationId": "PostPDFSectionContent",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["file_path", "section_name"],
+                "properties": {
+                  "file_path": {
+                    "type": "string",
+                    "description": "PDF 文档的本地路径或 URL"
+                  },
+                  "section_name": {
+                    "type": "string",
+                    "description": "章节名称或关键字，支持模糊匹配，传 * 可返回全文"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "提取成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SectionContentResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "请求参数校验失败",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "SectionContentResponse": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {
+            "type": "string",
+            "description": "状态标识 (success/error)"
+          },
+          "file_path": {
+            "type": "string",
+            "nullable": true
+          },
+          "section_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "matched_sections": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SectionMatch"
+            },
+            "description": "匹配到的章节列表"
+          },
+          "all_titles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "文档中所有标题列表"
+          },
+          "total_chars": {
+            "type": "integer",
+            "default": 0,
+            "description": "返回内容的总字符数"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true,
+            "description": "错误详情或提示信息"
+          }
+        }
+      },
+      "SectionMatch": {
+        "type": "object",
+        "required": ["title", "level", "score", "content"],
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "匹配到的章节主标题"
+          },
+          "level": {
+            "type": "integer",
+            "description": "标题层级"
+          },
+          "score": {
+            "type": "number",
+            "description": "模糊匹配得分"
+          },
+          "content": {
+            "type": "string",
+            "description": "章节的具体文字内容"
+          }
+        }
+      },
+      "PDFPageResult": {
+        "type": "object",
+        "required": ["page", "content", "tables"],
+        "properties": {
+          "page": {
+            "type": "integer",
+            "description": "页码（1-based）"
+          },
+          "content": {
+            "type": "string",
+            "description": "该页正文内容"
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "该页表格 Markdown 列表"
+          }
+        }
+      },
+      "PDFPageContentResponse": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {
+            "type": "string",
+            "description": "状态标识 (success/error)"
+          },
+          "file_path": {
+            "type": "string",
+            "nullable": true,
+            "description": "PDF 文件路径或 URL"
+          },
+          "page_numbers": {
+            "type": "string",
+            "nullable": true,
+            "description": "原始输入的页码字符串"
+          },
+          "pages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PDFPageResult"
+            },
+            "description": "每页提取结果列表"
+          },
+          "total_pages": {
+            "type": "integer",
+            "default": 0,
+            "description": "PDF 文档总页数"
+          },
+          "total_chars": {
+            "type": "integer",
+            "default": 0,
+            "description": "返回内容的总字符数"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true,
+            "description": "错误详情或提示信息"
+          }
+        }
+      },
+      "HTTPValidationError": {
+        "type": "object",
+        "properties": {
+          "detail": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            }
+          }
+        }
+      },
+      "ValidationError": {
+        "type": "object",
+        "required": ["loc", "msg", "type"],
+        "properties": {
+          "loc": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            }
+          },
+          "msg": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

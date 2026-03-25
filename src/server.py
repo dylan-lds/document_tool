@@ -35,6 +35,8 @@ load_dotenv()
 
 from src.utils.document_reader import get_section_content as _get_section_content
 from src.utils.pdf_reader import extract_pdf_content as _extract_pdf_content
+from src.utils.pdf_reader import get_pdf_section_content as _get_pdf_section_content
+from src.utils.pdf_reader import get_pdf_page_content as _get_pdf_page_content
 
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
@@ -80,6 +82,32 @@ class PDFContentResponse(BaseModel):
     message: str | None = Field(default=None, description="错误或提示信息")
 
 
+class PDFSectionContentResponse(BaseModel):
+    status: str = Field(description="success 或 error")
+    file_path: str | None = Field(default=None, description="输入文件路径")
+    section_name: str | None = Field(default=None, description="输入章节名")
+    matched_sections: list[SectionMatch] = Field(default_factory=list, description="匹配结果")
+    all_titles: list[str] = Field(default_factory=list, description="PDF所有章节标题")
+    total_chars: int = Field(default=0, description="返回内容总字符数")
+    message: str | None = Field(default=None, description="错误或提示信息")
+
+
+class PDFPageResult(BaseModel):
+    page: int = Field(description="页码（1-based）")
+    content: str = Field(default="", description="该页正文内容")
+    tables: list[str] = Field(default_factory=list, description="该页表格 Markdown 列表")
+
+
+class PDFPageContentResponse(BaseModel):
+    status: str = Field(description="success 或 error")
+    file_path: str | None = Field(default=None, description="输入文件路径")
+    page_numbers: str | None = Field(default=None, description="输入页码字符串")
+    pages: list[PDFPageResult] = Field(default_factory=list, description="每页提取结果")
+    total_pages: int = Field(default=0, description="PDF 总页数")
+    total_chars: int = Field(default=0, description="返回内容总字符数")
+    message: str | None = Field(default=None, description="错误或提示信息")
+
+
 def _run_section_query(file_path: str, section_name: str) -> dict:
     request_id = str(uuid.uuid4())[:8]
     start_at = time.perf_counter()
@@ -112,6 +140,44 @@ def _run_pdf_query(file_path: str) -> dict:
         request_id,
         result.get("status"),
         len(result.get("tables", [])),
+        elapsed,
+    )
+    return result
+
+
+def _run_pdf_page_query(file_path: str, page_numbers: str) -> dict:
+    request_id = str(uuid.uuid4())[:8]
+    start_at = time.perf_counter()
+    logger.info(
+        "[PDF按页提取][%s] 收到请求: file_path=%s, page_numbers='%s'",
+        request_id, file_path, page_numbers,
+    )
+    result = _get_pdf_page_content(file_path, page_numbers)
+    elapsed = time.perf_counter() - start_at
+    logger.info(
+        "[PDF按页提取][%s] 结束: status=%s pages=%d elapsed=%.2fs",
+        request_id,
+        result.get("status"),
+        len(result.get("pages", [])),
+        elapsed,
+    )
+    return result
+
+
+def _run_pdf_section_query(file_path: str, section_name: str) -> dict:
+    request_id = str(uuid.uuid4())[:8]
+    start_at = time.perf_counter()
+    logger.info(
+        "[PDF章节提取][%s] 收到请求: file_path=%s, section_name='%s'",
+        request_id, file_path, section_name,
+    )
+    result = _get_pdf_section_content(file_path, section_name)
+    elapsed = time.perf_counter() - start_at
+    logger.info(
+        "[PDF章节提取][%s] 结束: status=%s matched=%d elapsed=%.2fs",
+        request_id,
+        result.get("status"),
+        len(result.get("matched_sections", [])),
         elapsed,
     )
     return result
@@ -291,6 +357,118 @@ def create_openapi_app() -> Any:
             raise HTTPException(status_code=400, detail=result.get("message", "unknown error"))
         return PDFContentResponse(**result)
 
+    # ── PDF 章节提取 ────────────────────────────────────────────────────
+
+    @app.get(
+        "/pdf-section-content",
+        response_model=PDFSectionContentResponse,
+        tags=["document"],
+        summary="按章节提取PDF文档内容",
+        operation_id="GetPDFSectionContent",
+    )
+    async def get_pdf_section_content_http(
+        file_path: str = Query(description="PDF文件路径，支持本地路径或HTTP(S) URL"),
+        section_name: str = Query(description="章节名称，支持模糊匹配；传 * 返回全文"),
+    ) -> PDFSectionContentResponse:
+        result = _run_pdf_section_query(file_path, section_name)
+        if result.get("status") == "error":
+            raise HTTPException(status_code=400, detail=result.get("message", "unknown error"))
+        return PDFSectionContentResponse(**result)
+
+    # ── PDF 按页码提取 ──────────────────────────────────────────────────
+
+    @app.get(
+        "/pdf-page-content",
+        response_model=PDFPageContentResponse,
+        tags=["document"],
+        summary="按页码提取PDF内容",
+        operation_id="GetPDFPageContent",
+    )
+    async def get_pdf_page_content_http(
+        file_path: str = Query(description="PDF文件路径，支持本地路径或HTTP(S) URL"),
+        page_numbers: str = Query(description="页码，支持单页 '3'、范围 '2-5'、组合 '1,3-5,7'"),
+    ) -> PDFPageContentResponse:
+        result = _run_pdf_page_query(file_path, page_numbers)
+        if result.get("status") == "error":
+            raise HTTPException(status_code=400, detail=result.get("message", "unknown error"))
+        return PDFPageContentResponse(**result)
+
+    @app.post(
+        "/pdf-page-content",
+        response_model=PDFPageContentResponse,
+        tags=["document"],
+        summary="按页码提取PDF内容",
+        operation_id="PostPDFPageContent",
+    )
+    async def post_pdf_page_content_http(request: FastAPIRequest) -> PDFPageContentResponse:
+        content_type = (request.headers.get("content-type") or "").lower()
+        file_path: str | None = None
+        page_numbers: str | None = None
+
+        if "application/json" in content_type:
+            try:
+                payload = await request.json()
+            except json.JSONDecodeError as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"请求体 JSON 格式错误：{e.msg}",
+                ) from e
+            file_path = payload.get("file_path")
+            page_numbers = payload.get("page_numbers")
+        elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+            form = await request.form()
+            file_path = form.get("file_path")
+            page_numbers = form.get("page_numbers")
+        else:
+            file_path = request.query_params.get("file_path")
+            page_numbers = request.query_params.get("page_numbers")
+
+        if not file_path or not page_numbers:
+            raise HTTPException(status_code=400, detail="缺少必填参数 file_path 或 page_numbers")
+
+        result = _run_pdf_page_query(str(file_path), str(page_numbers))
+        if result.get("status") == "error":
+            raise HTTPException(status_code=400, detail=result.get("message", "unknown error"))
+        return PDFPageContentResponse(**result)
+
+    @app.post(
+        "/pdf-section-content",
+        response_model=PDFSectionContentResponse,
+        tags=["document"],
+        summary="按章节提取PDF文档内容",
+        operation_id="PostPDFSectionContent",
+    )
+    async def post_pdf_section_content_http(request: FastAPIRequest) -> PDFSectionContentResponse:
+        content_type = (request.headers.get("content-type") or "").lower()
+        file_path: str | None = None
+        section_name: str | None = None
+
+        if "application/json" in content_type:
+            try:
+                payload = await request.json()
+            except json.JSONDecodeError as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"请求体 JSON 格式错误：{e.msg}",
+                ) from e
+            file_path = payload.get("file_path")
+            section_name = payload.get("section_name")
+        elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+            form = await request.form()
+            file_path = form.get("file_path")
+            section_name = form.get("section_name")
+        else:
+            file_path = request.query_params.get("file_path")
+            section_name = request.query_params.get("section_name")
+
+        if not file_path or not section_name:
+            raise HTTPException(status_code=400, detail="缺少必填参数 file_path 或 section_name")
+
+        result = _run_pdf_section_query(str(file_path), str(section_name))
+        if result.get("status") == "error":
+            raise HTTPException(status_code=400, detail=result.get("message", "unknown error"))
+        return PDFSectionContentResponse(**result)
+
     return app
 
 
@@ -347,6 +525,38 @@ async def get_pdf_content(
     elapsed = time.perf_counter() - start_at
     await ctx.info(f"[PDF读取][{request_id}] 完成，耗时 {elapsed:.2f}s")
     return _format_pdf_mcp_output(result, file_path, elapsed)
+
+
+@mcp.tool()
+async def get_pdf_section_content(
+    file_path: Annotated[str, "PDF文件(.pdf)路径，支持本地路径或 HTTP(S) URL"],
+    section_name: Annotated[str, "章节名称，支持模糊匹配。传 * 返回全部内容"],
+    ctx: Context,
+) -> str:
+    """
+    从 PDF 文档中按章节名称提取内容。
+
+    - PDF 中的编号标题（如 '4.3.2 预验证结果'）自动识别为章节
+    - `section_name` 支持模糊匹配
+    - `section_name` 为 `*` 时返回全文
+    - 表格保留 HTML 格式，适合大模型输入
+    """
+    start_at = time.perf_counter()
+    request_id = str(uuid.uuid4())[:8]
+    await ctx.info(f"[PDF章节提取][{request_id}] 开始解析")
+
+    try:
+        result = _run_pdf_section_query(file_path, section_name)
+    except Exception as e:
+        logger.exception("[PDF章节提取][%s] 异常: %s", request_id, e)
+        await ctx.error(f"[PDF章节提取][{request_id}] 执行异常: {e}")
+        return f"❌ 提取失败：{e}"
+
+    elapsed = time.perf_counter() - start_at
+    await ctx.info(
+        f"[PDF章节提取][{request_id}] 完成，匹配 {len(result.get('matched_sections', []))} 个章节，耗时 {elapsed:.2f}s"
+    )
+    return _format_mcp_output(result, file_path, section_name, elapsed)
 
 
 def main_mcp(transport: str) -> None:
